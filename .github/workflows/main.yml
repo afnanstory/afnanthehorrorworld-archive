@@ -1,0 +1,164 @@
+# ============================================================
+#  afnanthehorrorworld-archive — GitHub Pages deploy
+#  ফাইলের জায়গা:  .github/workflows/deploy.yml
+#
+#  যা করে:
+#   1. Secrets আছে কি না চেক করে
+#   2. সাইটের ফাইল _site ফোল্ডারে কপি করে (আপনার সোর্স ফাইল অক্ষত থাকে)
+#   3. __SUPABASE_URL__ / __SUPABASE_KEY__ বদলে আসল মান বসায়
+#   4. কোনো placeholder বাকি থাকলে ডিপ্লয় থামিয়ে দেয়
+#   5. Supabase থেকে গল্পের তালিকা এনে sitemap.xml আর robots.txt বানায়
+#   6. GitHub Pages-এ ডিপ্লয় করে
+#
+#  আগে করে নিন (একবারই):
+#   - Settings → Pages → Source = "GitHub Actions"
+#   - Settings → Secrets and variables → Actions → Secrets:
+#       SUPABASE_URL   = https://xxxx.supabase.co
+#       SUPABASE_KEY   = anon (public) key   ← service_role key নয়!
+#   - (ঐচ্ছিক) নিজের ডোমেইন থাকলে Variables-এ SITE_URL = https://yourdomain.com
+# ============================================================
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:        # Actions ট্যাব থেকে হাতে চালানোর জন্য
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      SITE_URL_VAR: ${{ vars.SITE_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- 1. Secrets চেক ----------
+      - name: Check secrets
+        run: |
+          if [ -z "${SUPABASE_URL// /}" ] || [ -z "${SUPABASE_KEY// /}" ]; then
+            echo "::error::SUPABASE_URL বা SUPABASE_KEY secret খালি/নেই। Settings → Secrets and variables → Actions এ যোগ করুন।"
+            exit 1
+          fi
+
+      # ---------- 2. _site তৈরি ----------
+      - name: Prepare _site
+        run: |
+          mkdir -p _site
+          tar --exclude='./.git' \
+              --exclude='./.github' \
+              --exclude='./_site' \
+              --exclude='./node_modules' \
+              -cf - . | tar -xf - -C _site
+
+      # ---------- 3. placeholder বদল ----------
+      - name: Inject Supabase config
+        run: |
+          # স্পেস/নতুন লাইন কেটে ফেলা (secret পেস্ট করার সময় প্রায়ই থেকে যায়)
+          URL="$(printf '%s' "$SUPABASE_URL" | tr -d '[:space:]')"
+          KEY="$(printf '%s' "$SUPABASE_KEY" | tr -d '[:space:]')"
+
+          # sed-এর জন্য বিশেষ চিহ্ন escape (/ & | \)
+          esc() { printf '%s' "$1" | sed -e 's/[\/&|\\]/\\&/g'; }
+          URL_ESC="$(esc "$URL")"
+          KEY_ESC="$(esc "$KEY")"
+
+          find _site -type f -name '*.html' -print0 | while IFS= read -r -d '' f; do
+            sed -i \
+              -e "s|__SUPABASE_URL__|${URL_ESC}|g" \
+              -e "s|__SUPABASE_KEY__|${KEY_ESC}|g" \
+              "$f"
+          done
+
+      # ---------- 4. যাচাই ----------
+      - name: Verify placeholders replaced
+        run: |
+          if grep -rIl --include='*.html' -e '__SUPABASE_URL__' -e '__SUPABASE_KEY__' _site; then
+            echo "::error::উপরের ফাইলগুলোতে placeholder এখনো বাকি আছে।"
+            exit 1
+          fi
+          if ! grep -q 'supabase\.co' _site/index.html; then
+            echo "::warning::index.html এ supabase.co URL পাওয়া যায়নি — SUPABASE_URL ঠিক আছে কি না দেখুন।"
+          fi
+          echo "Placeholders replaced OK"
+
+      # ---------- 5. sitemap.xml + robots.txt ----------
+      - name: Generate sitemap.xml and robots.txt
+        run: |
+          set -euo pipefail
+          URL="$(printf '%s' "$SUPABASE_URL" | tr -d '[:space:]')"
+          KEY="$(printf '%s' "$SUPABASE_KEY" | tr -d '[:space:]')"
+
+          # সাইটের URL: Variables এ SITE_URL থাকলে সেটা, নাহলে GitHub Pages এর ডিফল্ট
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          if [ -n "${SITE_URL_VAR// /}" ]; then
+            SITE_URL="${SITE_URL_VAR// /}"
+          elif [ "${REPO,,}" = "${OWNER}.github.io" ]; then
+            SITE_URL="https://${OWNER}.github.io"
+          else
+            SITE_URL="https://${OWNER}.github.io/${REPO}"
+          fi
+          SITE_URL="${SITE_URL%/}/"
+          echo "Site URL: $SITE_URL"
+
+          # Supabase থেকে গল্পের তালিকা (ব্যর্থ হলে শুধু হোমপেজ যাবে, ডিপ্লয় থামবে না)
+          STORIES="$(curl -fsS --max-time 30 \
+            "${URL}/rest/v1/stories?select=file_name,created_at&order=created_at.asc" \
+            -H "apikey: ${KEY}" \
+            -H "Authorization: Bearer ${KEY}" || echo '[]')"
+          echo "$STORIES" | jq -e 'type == "array"' >/dev/null 2>&1 || STORIES='[]'
+          echo "Stories found: $(echo "$STORIES" | jq 'length')"
+
+          {
+            echo '<?xml version="1.0" encoding="UTF-8"?>'
+            echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            echo "  <url><loc>${SITE_URL}</loc><lastmod>$(date -u +%F)</lastmod><changefreq>weekly</changefreq><priority>1.0</priority></url>"
+            echo "$STORIES" | jq -r --arg base "$SITE_URL" '
+              .[]
+              | select((.file_name // "") != "")
+              | "  <url><loc>" + $base + (.file_name | gsub("&"; "&amp;")) + "</loc>"
+                + (if .created_at then "<lastmod>" + .created_at[0:10] + "</lastmod>" else "" end)
+                + "<changefreq>monthly</changefreq><priority>0.8</priority></url>"'
+            echo '</urlset>'
+          } > _site/sitemap.xml
+
+          {
+            echo 'User-agent: *'
+            echo 'Allow: /'
+            echo ''
+            echo "Sitemap: ${SITE_URL}sitemap.xml"
+          } > _site/robots.txt
+
+          echo "--- sitemap.xml ---"
+          cat _site/sitemap.xml
+
+      # ---------- 6. ডিপ্লয় ----------
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
